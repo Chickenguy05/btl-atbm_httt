@@ -2,12 +2,15 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import time
 from pathlib import Path
 from typing import Any
 
 from werkzeug.security import generate_password_hash
 
 from .blockchain import Block, DocumentBlockchain
+from .blockchain_manager import BlockchainManager
+from .verify_utils import verify_chain
 
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
@@ -100,8 +103,15 @@ def migrate_users(conn: sqlite3.Connection) -> None:
 def load_blockchain() -> DocumentBlockchain:
     BLOCKCHAIN_FILE.parent.mkdir(exist_ok=True)
     if BLOCKCHAIN_FILE.exists():
-        with open(BLOCKCHAIN_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
+        # New storage format is handled by BlockchainManager (backward-compatible with legacy list).
+        manager = BlockchainManager(ROOT_DIR)
+        payload = manager.load_chain_payload()
+        chain_data = payload["chain"]
+        # Best-effort integrity check at load time (do not throw to keep old flows alive).
+        ok, bad, reason = verify_chain(chain_data) if isinstance(chain_data, list) else (False, None, "invalid_payload")
+        if not ok:
+            # Caller (main startup/background verifier) can trigger recovery; here we just warn.
+            print(f"WARNING: blockchain.json integrity issue at {bad}: {reason}")
         blocks = [
             Block(
                 index=block_data["index"],
@@ -115,11 +125,11 @@ def load_blockchain() -> DocumentBlockchain:
                 metadata=block_data.get("metadata"),
                 file_path=block_data.get("file_path", ""),
                 qr_path=block_data.get("qr_path", ""),
-                nonce=block_data["nonce"],
-                hash=block_data["hash"],
+                nonce=block_data.get("nonce", 0),
+                hash=block_data.get("hash", ""),
                 issuer_name=block_data.get("issuer_name", ""),
             )
-            for block_data in data
+            for block_data in (chain_data or [])
         ]
         blockchain = DocumentBlockchain(blocks=blocks)
     else:
@@ -164,9 +174,12 @@ def save_block(block: Block) -> None:
 
 def save_blockchain(blockchain: DocumentBlockchain) -> None:
     BLOCKCHAIN_FILE.parent.mkdir(exist_ok=True)
+    manager = BlockchainManager(ROOT_DIR)
     data = [block.__dict__ for block in blockchain.chain]
-    with open(BLOCKCHAIN_FILE, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
+    # Store in new format + update checksum (safe write + backup handled internally).
+    manager.storage.save({"chain": data, "last_update": time.time()})
+    # Keep checksum consistent for tamper-detection.
+    manager._write_checksum(data)
 
 
 def list_blocks() -> list[dict]:

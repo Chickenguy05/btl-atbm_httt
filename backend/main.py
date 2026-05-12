@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import os
 import sqlite3
 from datetime import datetime, timezone
@@ -14,8 +15,12 @@ from pydantic import BaseModel
 from starlette.middleware.sessions import SessionMiddleware
 from werkzeug.security import check_password_hash
 
+from .api_blockchain_routes import build_blockchain_router
+from .background_verifier import BackgroundVerifier
+from .blockchain_manager import BlockchainManager
 from .certificate_utils import build_certificate_pdf, generate_certificate_qr
 from .crypto_utils import ensure_key_pair, sha256_bytes, sign_hash, verify_signature
+from .recovery_manager import RecoveryFailed, RecoveryManager
 from .storage import (
     create_user,
     delete_user,
@@ -31,6 +36,9 @@ from .storage import (
 
 app = FastAPI(title="DocumentChain API")
 FRONTEND_BASE_URL = os.environ.get("FRONTEND_BASE_URL", "http://127.0.0.1:5173").rstrip("/")
+ROOT_DIR = Path(__file__).resolve().parent.parent
+NODE_ROLE = os.environ.get("NODE_ROLE", "leader").strip().lower()  # leader | replica
+app.include_router(build_blockchain_router(ROOT_DIR))
 app.add_middleware(
     SessionMiddleware,
     secret_key=os.environ.get("SECRET_KEY", "document-auth-demo-secret"),
@@ -104,6 +112,34 @@ def require_roles(*roles: str):
 def startup() -> None:
     ensure_key_pair()
     load_blockchain()
+    # New blockchain services: verify + checksum + (leader) recovery.
+    manager = BlockchainManager(ROOT_DIR)
+    manager.ensure_genesis()
+
+    replica_urls = [u.strip() for u in os.environ.get("REPLICA_URLS", "").split(",") if u.strip()]
+    recovery = RecoveryManager(ROOT_DIR, manager, replica_urls=replica_urls)
+
+    def on_corruption(reason: str) -> None:
+        if NODE_ROLE != "leader":
+            logging.getLogger(__name__).error("Replica detected corruption: %s", reason)
+            return
+        try:
+            logging.getLogger(__name__).warning("Triggering recovery due to: %s", reason)
+            recovery.recover()
+        except RecoveryFailed:
+            logging.getLogger(__name__).exception("Auto recovery failed")
+        except Exception:
+            logging.getLogger(__name__).exception("Unexpected recovery error")
+
+    ok, bad, reason = manager.verify_local()
+    if not ok:
+        logging.getLogger(__name__).error("Startup verify failed bad=%s reason=%s", bad, reason)
+        on_corruption(reason)
+    else:
+        logging.getLogger(__name__).info("Startup verify OK")
+
+    # Background verifier every 30s
+    BackgroundVerifier(manager.verify_local, on_corruption, interval_s=30.0).start()
 
 
 @app.get("/api/health")
